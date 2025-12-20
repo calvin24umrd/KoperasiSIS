@@ -1,8 +1,8 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart'; 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Untuk Filtering Angka
-import 'package:image_picker/image_picker.dart';
+import 'package:flutter/services.dart';
+import 'package:camera/camera.dart'; 
 import 'package:provider/provider.dart';
 import 'auth_service.dart';
 import 'restapi.dart';
@@ -15,9 +15,7 @@ class KYCFormScreen extends StatefulWidget {
 }
 
 class _KYCFormScreenState extends State<KYCFormScreen> {
-  // Kunci untuk Validasi Form
   final _formKey = GlobalKey<FormState>();
-
   final _phoneCtrl = TextEditingController();
   final _nikCtrl = TextEditingController();
   final _addrCtrl = TextEditingController();
@@ -26,25 +24,90 @@ class _KYCFormScreenState extends State<KYCFormScreen> {
   
   XFile? _selfie;
   XFile? _ktp;
-  final ImagePicker _picker = ImagePicker();
+  // REMOVED: ImagePicker unused
   bool _isSubmitting = false;
 
-  Future<void> _submitKYC() async {
-    // 1. CEK VALIDASI TEXT (NIK 16 digit, dll)
-    if (!_formKey.currentState!.validate()) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text("Mohon perbaiki data yang merah/salah!"),
-        backgroundColor: Colors.red,
-      ));
+  // Camera Vars
+  CameraController? _cameraController;
+  List<CameraDescription>? _cameras;
+  bool _isCameraReady = false;
+  bool _isShowingCamera = false;
+  String? _currentPhotoType; 
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      _cameras = await availableCameras();
+    } catch (e) {
+      // ignore: avoid_print
+      print("Camera init error: $e");
+    }
+  }
+
+  Future<void> _startCamera(String type) async {
+    if (_cameras == null || _cameras!.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Kamera tidak ditemukan!")));
       return;
     }
 
-    // 2. CEK VALIDASI FOTO
+    var camera = _cameras!.firstWhere(
+      (c) => c.lensDirection == (type == 'selfie' ? CameraLensDirection.front : CameraLensDirection.back),
+      orElse: () => _cameras![0],
+    );
+
+    _cameraController = CameraController(camera, ResolutionPreset.high, enableAudio: false);
+    await _cameraController!.initialize();
+    
+    if (mounted) {
+      setState(() {
+        _isCameraReady = true;
+        _isShowingCamera = true;
+        _currentPhotoType = type;
+      });
+    }
+  }
+
+  Future<void> _takePicture() async {
+    if (!_cameraController!.value.isInitialized) return;
+    
+    try {
+      final image = await _cameraController!.takePicture();
+      
+      if (!mounted) return;
+      showDialog(
+        context: context, 
+        barrierDismissible: false,
+        builder: (ctx) => const Center(child: CircularProgressIndicator())
+      );
+      
+      await Future.delayed(const Duration(seconds: 2)); 
+      if (mounted) Navigator.pop(context); 
+
+      if (mounted) {
+        setState(() {
+          if (_currentPhotoType == 'selfie') _selfie = image;
+          else _ktp = image;
+          _isShowingCamera = false;
+          _isCameraReady = false;
+        });
+      }
+      _cameraController?.dispose();
+
+    } catch (e) {
+      // ignore: avoid_print
+      print(e);
+    }
+  }
+
+  Future<void> _submitKYC() async {
+    if (!_formKey.currentState!.validate()) return;
     if (_selfie == null || _ktp == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text("Foto Selfie & KTP Wajib Diambil!"),
-        backgroundColor: Colors.red,
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Foto Selfie & KTP Wajib!"), backgroundColor: Colors.red));
       return;
     }
 
@@ -54,15 +117,9 @@ class _KYCFormScreenState extends State<KYCFormScreen> {
       final auth = Provider.of<AuthService>(context, listen: false);
       final api = DataService();
 
-      // Upload Foto
       String selfieUrl = await api.upload(await _selfie!.readAsBytes(), "selfie_${DateTime.now().millisecondsSinceEpoch}.jpg");
       String ktpUrl = await api.upload(await _ktp!.readAsBytes(), "ktp_${DateTime.now().millisecondsSinceEpoch}.jpg");
 
-      if (selfieUrl.isEmpty || ktpUrl.isEmpty) {
-        throw Exception("Gagal upload gambar ke server");
-      }
-
-      // Update User Profile
       UserModel updated = UserModel(
         id: auth.currentUser!.id,
         email: auth.currentUser!.email,
@@ -70,8 +127,6 @@ class _KYCFormScreenState extends State<KYCFormScreen> {
         role: auth.currentUser!.role,
         name: auth.currentUser!.name,
         joinDate: auth.currentUser!.joinDate,
-        
-        // Data Penting:
         phone: _phoneCtrl.text,
         nik: _nikCtrl.text,
         address: _addrCtrl.text,
@@ -79,157 +134,120 @@ class _KYCFormScreenState extends State<KYCFormScreen> {
         job: _jobCtrl.text,
         selfieImage: selfieUrl,
         ktpImage: ktpUrl,
-        isVerified: true, // STATUS RESMI VERIFIED
+        isVerified: true, 
       );
 
       await auth.updateProfile(updated);
       
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Verifikasi Data Berhasil!")));
-      Navigator.pushReplacementNamed(context, '/loan-application');
+      
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Verifikasi Berhasil", style: TextStyle(color: Colors.green)),
+          content: const Text("Data diri Anda telah tersimpan."),
+          actions: [
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                if (mounted) Navigator.pushReplacementNamed(context, '/loan-application'); 
+              },
+              child: const Text("Lanjut"),
+            )
+          ],
+        )
+      );
 
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Terjadi Kesalahan: $e"), backgroundColor: Colors.red));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red));
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
   }
 
-  // Widget Pembantu untuk Kotak Foto
-  Widget _buildPhotoBox(String label, XFile? file, VoidCallback onTap) {
-    return Column(
+  Widget _buildCameraOverlay() {
+    return Stack(
       children: [
-        GestureDetector(
-          onTap: onTap,
-          child: Container(
-            height: 110, width: 140,
-            decoration: BoxDecoration(
-              color: Colors.grey[100], 
-              border: Border.all(color: file == null ? Colors.grey : Colors.green, width: 2),
-              borderRadius: BorderRadius.circular(10)
-            ),
-            child: file == null 
-              ? Column(mainAxisAlignment: MainAxisAlignment.center, children: const [Icon(Icons.camera_alt, color: Colors.grey, size: 30), Text("Ambil Foto", style: TextStyle(fontSize: 10))])
-              : ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: kIsWeb ? Image.network(file.path, fit: BoxFit.cover) : Image.file(File(file.path), fit: BoxFit.cover)
+        SizedBox(height: double.infinity, width: double.infinity, child: CameraPreview(_cameraController!)),
+        ColorFiltered(
+          colorFilter: const ColorFilter.mode(Colors.black54, BlendMode.srcOut),
+          child: Stack(
+            children: [
+              Container(decoration: const BoxDecoration(color: Colors.transparent, backgroundBlendMode: BlendMode.dstOut)),
+              Center(
+                child: Container(
+                  height: _currentPhotoType == 'ktp' ? 200 : 300,
+                  width: _currentPhotoType == 'ktp' ? 320 : 300,
+                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(_currentPhotoType == 'ktp' ? 10 : 200)),
                 ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(height: 5),
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))
+        Positioned(
+          bottom: 30, left: 0, right: 0,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              FloatingActionButton(backgroundColor: Colors.red, child: const Icon(Icons.close), onPressed: () { setState(() { _isShowingCamera = false; _cameraController?.dispose(); }); }),
+              const SizedBox(width: 40),
+              FloatingActionButton(backgroundColor: Colors.white, onPressed: _takePicture, child: const Icon(Icons.camera, color: Colors.black, size: 30)),
+            ],
+          ),
+        )
       ],
     );
   }
 
+  Widget _buildPhotoBox(String label, XFile? file, String type) {
+    return Column(children: [
+      GestureDetector(
+        onTap: () => _startCamera(type),
+        child: Container(
+          height: 100, width: 140,
+          decoration: BoxDecoration(color: Colors.grey[100], border: Border.all(color: file == null ? Colors.grey : Colors.green), borderRadius: BorderRadius.circular(10)),
+          child: file == null 
+            ? Column(mainAxisAlignment: MainAxisAlignment.center, children: const [Icon(Icons.camera_alt, color: Colors.grey), Text("Scan Foto", style: TextStyle(fontSize: 10))])
+            : ClipRRect(borderRadius: BorderRadius.circular(8), child: kIsWeb ? Image.network(file.path, fit: BoxFit.cover) : Image.file(File(file.path), fit: BoxFit.cover)),
+        ),
+      ),
+      const SizedBox(height: 5),
+      Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_isShowingCamera && _isCameraReady) return Scaffold(body: _buildCameraOverlay());
+
     return Scaffold(
       backgroundColor: const Color(0xFFF3E8FF),
-      appBar: AppBar(
-        title: const Text("Verifikasi Data Diri (KYC)", style: TextStyle(color: Colors.white, fontSize: 18)),
-        backgroundColor: const Color(0xFF8B5CF6),
-        iconTheme: const IconThemeData(color: Colors.white),
-      ),
+      appBar: AppBar(title: const Text("Verifikasi Data Diri"), backgroundColor: const Color(0xFF8B5CF6)),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
-        child: Form( // WRAP DENGAN FORM AGAR BISA VALIDASI
+        child: Form(
           key: _formKey,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("Data Identitas Wajib Diisi Lengkap", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 20),
-              
-              // FOTO SECTION
-              Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                _buildPhotoBox("Selfie dengan KTP", _selfie, () async {
-                  final f = await _picker.pickImage(source: ImageSource.camera, imageQuality: 50);
-                  if(f!=null) setState(()=>_selfie=f);
-                }),
-                _buildPhotoBox("Foto E-KTP Asli", _ktp, () async {
-                  final f = await _picker.pickImage(source: ImageSource.camera, imageQuality: 50);
-                  if(f!=null) setState(()=>_ktp=f);
-                }),
-              ]),
-              const Divider(height: 40),
-
-              // NIK (VALIDASI KETAT)
-              TextFormField(
-                controller: _nikCtrl,
-                keyboardType: TextInputType.number,
-                maxLength: 16, // Max 16 Digit
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly], // Cuma boleh angka
-                decoration: const InputDecoration(
-                  labelText: "Nomor Induk Kependudukan (NIK)",
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.credit_card),
-                  counterText: "", // Sembunyikan counter 0/16
-                ),
-                validator: (value) {
-                  if (value == null || value.isEmpty) return "NIK wajib diisi";
-                  if (value.length != 16) return "NIK harus pas 16 digit!";
-                  return null;
-                },
-              ),
-              const SizedBox(height: 15),
-
-              // NO HP
-              TextFormField(
-                controller: _phoneCtrl,
-                keyboardType: TextInputType.phone,
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                decoration: const InputDecoration(labelText: "Nomor Handphone Aktif", border: OutlineInputBorder(), prefixIcon: Icon(Icons.phone_android)),
-                validator: (value) {
-                  if (value == null || value.isEmpty) return "No HP wajib diisi";
-                  if (value.length < 10) return "No HP minimal 10 digit";
-                  if (value.length > 13) return "No HP maksimal 13 digit";
-                  return null;
-                },
-              ),
-              const SizedBox(height: 15),
-
-              // ALAMAT DOMISILI
-              TextFormField(
-                controller: _addrCtrl,
-                maxLines: 2,
-                decoration: const InputDecoration(labelText: "Alamat Domisili Lengkap", border: OutlineInputBorder(), prefixIcon: Icon(Icons.home)),
-                validator: (v) => v!.isEmpty ? "Alamat wajib diisi lengkap (Jalan, RT/RW)" : null,
-              ),
-              const SizedBox(height: 15),
-
-              // PEKERJAAN
-              TextFormField(
-                controller: _jobCtrl,
-                decoration: const InputDecoration(labelText: "Pekerjaan Saat Ini", border: OutlineInputBorder(), prefixIcon: Icon(Icons.work)),
-                validator: (v) => v!.isEmpty ? "Pekerjaan wajib diisi" : null,
-              ),
-              const SizedBox(height: 15),
-
-              // ALAMAT KANTOR
-              TextFormField(
-                controller: _officeAddrCtrl,
-                maxLines: 2,
-                decoration: const InputDecoration(labelText: "Alamat Kantor / Tempat Usaha", border: OutlineInputBorder(), prefixIcon: Icon(Icons.location_city)),
-                validator: (v) => v!.isEmpty ? "Alamat kantor wajib diisi" : null,
-              ),
-
-              const SizedBox(height: 30),
-              SizedBox(
-                width: double.infinity,
-                height: 50,
-                child: ElevatedButton(
-                  onPressed: _isSubmitting ? null : _submitKYC,
-                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF8B5CF6)),
-                  child: _isSubmitting 
-                    ? const CircularProgressIndicator(color: Colors.white) 
-                    : const Text("VERIFIKASI DATA", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-                ),
-              ),
-              const SizedBox(height: 20),
-            ],
-          ),
+          child: Column(children: [
+            const Text("Lengkapi data untuk verifikasi otomatis", style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+              _buildPhotoBox("Selfie Wajah", _selfie, 'selfie'),
+              _buildPhotoBox("E-KTP", _ktp, 'ktp'),
+            ]),
+            const SizedBox(height: 20),
+            TextFormField(controller: _nikCtrl, maxLength: 16, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(labelText: "NIK", border: OutlineInputBorder(), counterText: ""), validator: (v) => v!.length != 16 ? "NIK harus 16 digit" : null),
+            const SizedBox(height: 10),
+            TextFormField(controller: _phoneCtrl, keyboardType: TextInputType.phone, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(labelText: "No HP", border: OutlineInputBorder()), validator: (v) => v!.isEmpty ? "Wajib diisi" : null),
+            const SizedBox(height: 10),
+            TextFormField(controller: _addrCtrl, maxLines: 2, decoration: const InputDecoration(labelText: "Alamat Domisili", border: OutlineInputBorder()), validator: (v) => v!.isEmpty ? "Wajib diisi" : null),
+            const SizedBox(height: 10),
+            TextFormField(controller: _jobCtrl, decoration: const InputDecoration(labelText: "Pekerjaan", border: OutlineInputBorder()), validator: (v) => v!.isEmpty ? "Wajib diisi" : null),
+            const SizedBox(height: 10),
+            TextFormField(controller: _officeAddrCtrl, decoration: const InputDecoration(labelText: "Alamat Kantor", border: OutlineInputBorder()), validator: (v) => v!.isEmpty ? "Wajib diisi" : null),
+            const SizedBox(height: 20),
+            SizedBox(width: double.infinity, height: 50, child: ElevatedButton(onPressed: _isSubmitting ? null : _submitKYC, style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF8B5CF6)), child: _isSubmitting ? const CircularProgressIndicator(color: Colors.white) : const Text("VERIFIKASI DATA", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))))
+          ]),
         ),
       ),
     );
